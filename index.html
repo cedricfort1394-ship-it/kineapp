@@ -1543,6 +1543,30 @@ body.fullscreen .fullscreen-exit { display: flex; }
   transition: all 0.15s;
 }
 .history-btn:hover { border-color: var(--vert); color: var(--vert-light); }
+
+/* ══ SYNC INDICATOR ══ */
+.sync-indicator {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; color: var(--text-dim);
+  padding: 6px 12px;
+  border-radius: 50px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.sync-indicator:hover { border-color: var(--vert); color: var(--vert-light); }
+.sync-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: background 0.3s;
+}
+.sync-dot.synced { background: var(--vert-light); }
+.sync-dot.syncing { background: var(--accent-gold); animation: pulse 1s infinite; }
+.sync-dot.error { background: var(--rouge); }
+
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
 </style>
 </head>
 <body>
@@ -1563,7 +1587,13 @@ body.fullscreen .fullscreen-exit { display: flex; }
       <span class="logo-sub">Kinésithérapie du Sport</span>
     </div>
   </div>
-  <div class="header-date" id="today-date"></div>
+  <div style="display:flex;align-items:center;gap:10px;">
+    <div class="sync-indicator" onclick="syncPatients()" id="sync-btn">
+      <div class="sync-dot" id="sync-dot"></div>
+      <span id="sync-label">Google Sheets</span>
+    </div>
+    <div class="header-date" id="today-date"></div>
+  </div>
 </header>
 
 <!-- NAV -->
@@ -1723,6 +1753,8 @@ document.addEventListener('DOMContentLoaded', () => {
   renderLCAList();
   loadFavWods();
   loadHistorique();
+  // Auto-sync with Google Sheets on load
+  setTimeout(() => fetchPatientsFromSheets(), 1000);
 });
 
 // ── NAV ──
@@ -2265,6 +2297,16 @@ function sauvegarderPatient() {
     });
   }
 
+  const isNew = !editId;
+  const savedPatient = editId
+    ? patients.find(p => p.id === editId)
+    : patients[patients.length - 1];
+
+  if (savedPatient) {
+    savedPatient._isNew = isNew;
+    pushPatientToSheets(savedPatient);
+  }
+
   saveCustomPatients();
   document.getElementById('patient-modal-overlay').classList.remove('open');
   renderPatients();
@@ -2280,7 +2322,9 @@ function archiverPatient(id) {
   if (!confirm(`Archiver ${p.prenom} ? La fiche sera masquée mais conservée.`)) return;
   p.actif = 'Non';
   p._modified = true;
+  p._isNew = false;
   state.selectedPatients.delete(id);
+  pushPatientToSheets(p);
   saveCustomPatients();
   renderPatients();
 }
@@ -2314,6 +2358,98 @@ function setDualSide(side, idx) {
 
 
 
+
+
+// ══════════════════════════════════════════════════════════
+// GOOGLE SHEETS SYNC
+// ══════════════════════════════════════════════════════════
+
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycbwmn6WkxZDJe5w-RjRV1LqbUKPaPly3sfh5BraDa5G5G-JxiuWd9qJIUt0dZlXqd6c/exec";
+let sheetsConnected = false;
+
+function setSyncStatus(status) {
+  const dot = document.getElementById('sync-dot');
+  const label = document.getElementById('sync-label');
+  if (!dot || !label) return;
+  dot.className = 'sync-dot ' + status;
+  if (status === 'synced') label.textContent = 'Synchronisé';
+  else if (status === 'syncing') label.textContent = 'Sync...';
+  else if (status === 'error') label.textContent = 'Hors ligne';
+  else label.textContent = 'Google Sheets';
+}
+
+async function syncPatients() {
+  setSyncStatus('syncing');
+  try {
+    const resp = await fetch(SHEETS_URL, { method: 'GET', mode: 'no-cors' });
+    // no-cors won't give us readable response, use a workaround
+    await fetchPatientsFromSheets();
+  } catch(e) {
+    setSyncStatus('error');
+  }
+}
+
+async function fetchPatientsFromSheets() {
+  setSyncStatus('syncing');
+  try {
+    const resp = await fetch(SHEETS_URL + '?t=' + Date.now());
+    const data = await resp.json();
+    if (data.patients && data.patients.length > 0) {
+      // Merge sheets patients with local — sheets takes priority
+      data.patients.forEach(sp => {
+        if (!sp.ID || !sp.PRÉNOM) return;
+        const sheetPatient = {
+          id: sp.ID,
+          prenom: sp.PRÉNOM || '',
+          zone_prio: sp.ZONE_PRIORITAIRE || '',
+          zone_sec: sp.ZONE_SECONDAIRE || '',
+          niveau: sp.NIVEAU || 'Intermédiaire',
+          blocs_exclus: sp.BLOCS_EXCLUS || '',
+          actif: sp.ACTIF || 'Oui',
+          notes: sp.NOTES || '',
+          _fromSheets: true
+        };
+        const idx = patients.findIndex(p => p.id === sp.ID);
+        if (idx >= 0) patients[idx] = sheetPatient;
+        else patients.push(sheetPatient);
+      });
+      sheetsConnected = true;
+      setSyncStatus('synced');
+      renderPatients();
+    } else {
+      setSyncStatus('synced');
+    }
+  } catch(e) {
+    setSyncStatus('error');
+    console.warn('Google Sheets sync failed:', e);
+  }
+}
+
+async function pushPatientToSheets(patient) {
+  if (!sheetsConnected) return;
+  try {
+    await fetch(SHEETS_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: patient._isNew ? 'add' : 'update',
+        patient: {
+          ID: patient.id,
+          PRÉNOM: patient.prenom,
+          ZONE_PRIORITAIRE: patient.zone_prio,
+          ZONE_SECONDAIRE: patient.zone_sec || '',
+          NIVEAU: patient.niveau,
+          BLOCS_EXCLUS: patient.blocs_exclus || '',
+          ACTIF: patient.actif,
+          NOTES: patient.notes || ''
+        }
+      })
+    });
+  } catch(e) {
+    console.warn('Push to sheets failed:', e);
+  }
+}
 
 // ══════════════════════════════════════════════════════════
 // WOD FAVORIS
