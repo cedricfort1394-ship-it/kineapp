@@ -1754,7 +1754,10 @@ document.addEventListener('DOMContentLoaded', () => {
   loadFavWods();
   loadHistorique();
   // Auto-sync with Google Sheets on load
-  setTimeout(() => fetchPatientsFromSheets(), 1000);
+  setTimeout(() => {
+    flushPendingQueue();
+    fetchPatientsFromSheets();
+  }, 1000);
 });
 
 // ── NAV ──
@@ -2378,77 +2381,120 @@ function setSyncStatus(status) {
   else label.textContent = 'Google Sheets';
 }
 
-async function syncPatients() {
-  setSyncStatus('syncing');
-  try {
-    const resp = await fetch(SHEETS_URL, { method: 'GET', mode: 'no-cors' });
-    // no-cors won't give us readable response, use a workaround
-    await fetchPatientsFromSheets();
-  } catch(e) {
-    setSyncStatus('error');
-  }
+function syncPatients() {
+  fetchPatientsFromSheets();
 }
 
-async function fetchPatientsFromSheets() {
+// JSONP — contourne le problème CORS avec Google Apps Script
+function fetchPatientsFromSheets() {
   setSyncStatus('syncing');
-  try {
-    const resp = await fetch(SHEETS_URL + '?t=' + Date.now());
-    const data = await resp.json();
-    if (data.patients && data.patients.length > 0) {
-      // Merge sheets patients with local — sheets takes priority
-      data.patients.forEach(sp => {
-        if (!sp.ID || !sp.PRÉNOM) return;
-        const sheetPatient = {
-          id: sp.ID,
-          prenom: sp.PRÉNOM || '',
-          zone_prio: sp.ZONE_PRIORITAIRE || '',
-          zone_sec: sp.ZONE_SECONDAIRE || '',
-          niveau: sp.NIVEAU || 'Intermédiaire',
-          blocs_exclus: sp.BLOCS_EXCLUS || '',
-          actif: sp.ACTIF || 'Oui',
-          notes: sp.NOTES || '',
-          _fromSheets: true
-        };
-        const idx = patients.findIndex(p => p.id === sp.ID);
-        if (idx >= 0) patients[idx] = sheetPatient;
-        else patients.push(sheetPatient);
-      });
-      sheetsConnected = true;
-      setSyncStatus('synced');
-      renderPatients();
-    } else {
-      setSyncStatus('synced');
+  const callbackName = 'sheetsCallback_' + Date.now();
+  const script = document.createElement('script');
+  
+  window[callbackName] = function(data) {
+    delete window[callbackName];
+    document.head.removeChild(script);
+    try {
+      if (data.patients && data.patients.length > 0) {
+        data.patients.forEach(sp => {
+          if (!sp.ID || !sp.PRÉNOM) return;
+          const sheetPatient = {
+            id: String(sp.ID),
+            prenom: sp.PRÉNOM || '',
+            zone_prio: sp.ZONE_PRIORITAIRE || '',
+            zone_sec: sp.ZONE_SECONDAIRE || '',
+            niveau: sp.NIVEAU || 'Intermédiaire',
+            blocs_exclus: sp.BLOCS_EXCLUS || '',
+            actif: sp.ACTIF || 'Oui',
+            notes: sp.NOTES || '',
+            _fromSheets: true
+          };
+          const idx = patients.findIndex(p => p.id === String(sp.ID));
+          if (idx >= 0) patients[idx] = sheetPatient;
+          else patients.push(sheetPatient);
+        });
+        sheetsConnected = true;
+        setSyncStatus('synced');
+        renderPatients();
+      } else {
+        sheetsConnected = true;
+        setSyncStatus('synced');
+      }
+    } catch(e) {
+      setSyncStatus('error');
     }
-  } catch(e) {
+  };
+
+  script.onerror = function() {
+    delete window[callbackName];
+    document.head.removeChild(script);
     setSyncStatus('error');
-    console.warn('Google Sheets sync failed:', e);
-  }
+  };
+
+  script.src = SHEETS_URL + '?callback=' + callbackName + '&t=' + Date.now();
+  document.head.appendChild(script);
 }
 
-async function pushPatientToSheets(patient) {
-  if (!sheetsConnected) return;
+// POST via formulaire caché — contourne CORS pour l'écriture
+function pushPatientToSheets(patient) {
   try {
-    await fetch(SHEETS_URL, {
+    const payload = {
+      action: patient._isNew ? 'add' : 'update',
+      patient: {
+        ID: patient.id,
+        PRÉNOM: patient.prenom,
+        ZONE_PRIORITAIRE: patient.zone_prio,
+        ZONE_SECONDAIRE: patient.zone_sec || '',
+        NIVEAU: patient.niveau,
+        BLOCS_EXCLUS: patient.blocs_exclus || '',
+        ACTIF: patient.actif,
+        NOTES: patient.notes || ''
+      }
+    };
+
+    // Use fetch with text/plain to avoid CORS preflight
+    fetch(SHEETS_URL, {
       method: 'POST',
-      mode: 'no-cors',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: patient._isNew ? 'add' : 'update',
-        patient: {
-          ID: patient.id,
-          PRÉNOM: patient.prenom,
-          ZONE_PRIORITAIRE: patient.zone_prio,
-          ZONE_SECONDAIRE: patient.zone_sec || '',
-          NIVEAU: patient.niveau,
-          BLOCS_EXCLUS: patient.blocs_exclus || '',
-          ACTIF: patient.actif,
-          NOTES: patient.notes || ''
-        }
-      })
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify(payload)
+    }).then(() => {
+      setSyncStatus('synced');
+    }).catch(() => {
+      // Fallback: store in pending queue
+      addToPendingQueue(payload);
     });
   } catch(e) {
-    console.warn('Push to sheets failed:', e);
+    console.warn('Push failed:', e);
   }
+}
+
+// Pending queue — si hors ligne, on réessaie au prochain sync
+let pendingQueue = [];
+
+function addToPendingQueue(payload) {
+  pendingQueue.push(payload);
+  try { localStorage.setItem('kineapp_pending', JSON.stringify(pendingQueue)); } catch(e) {}
+}
+
+function flushPendingQueue() {
+  try {
+    const saved = localStorage.getItem('kineapp_pending');
+    if (saved) pendingQueue = JSON.parse(saved);
+  } catch(e) {}
+
+  if (!pendingQueue.length) return;
+  
+  const toSend = [...pendingQueue];
+  pendingQueue = [];
+  localStorage.removeItem('kineapp_pending');
+
+  toSend.forEach(payload => {
+    fetch(SHEETS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify(payload)
+    }).catch(() => addToPendingQueue(payload));
+  });
 }
 
 // ══════════════════════════════════════════════════════════
