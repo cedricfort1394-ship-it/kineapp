@@ -1753,6 +1753,19 @@ document.addEventListener('DOMContentLoaded', () => {
   renderLCAList();
   loadFavWods();
   loadHistorique();
+
+  // Restaurer les séances du jour si elles existent
+  const hadSeances = loadDailySeances();
+  if (hadSeances) {
+    renderPatients();
+    // Affiche une notification discrète
+    const notif = document.createElement('div');
+    notif.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:var(--bg-elevated);border:1px solid var(--border-vert);color:var(--vert-light);padding:10px 20px;border-radius:50px;font-size:13px;font-weight:600;z-index:500;animation:fadeIn 0.3s ease;';
+    notif.textContent = state.seances.length + ' séance(s) du jour restaurée(s)';
+    document.body.appendChild(notif);
+    setTimeout(() => notif.remove(), 3000);
+  }
+
   // Auto-sync with Google Sheets on load
   setTimeout(() => {
     flushPendingQueue();
@@ -1918,6 +1931,7 @@ function genererSeances(){
   state.dualLeft=0;
   state.dualRight=Math.min(1, state.seances.length-1);
   sauvegarderSeancesHistorique();
+  saveDailySeances();
   showScreen('seances');
   renderSeances();
 }
@@ -1936,6 +1950,7 @@ function effacerSeances() {
   state.seances = [];
   state.currentSeanceIdx = 0;
   state.selectedPatients.clear();
+  clearDailySeances();
   renderPatients();
   renderSeances();
 }
@@ -2086,6 +2101,7 @@ function navSeance(dir){
 
 function regenererSeance(i){
   state.seances[i].exercices=genererSeancePourPatient(state.seances[i].patient);
+  saveDailySeances();
   renderSeances();
 }
 
@@ -2140,6 +2156,7 @@ function remplacerExo(id){
   if(!ex) return;
   state.seances[state.modalSeanceIdx].exercices[state.modalExoIdx]={...ex,_bloc:ex.bloc};
   document.getElementById('modal-overlay').classList.remove('open');
+  saveDailySeances();
   renderSeances();
 }
 
@@ -2349,6 +2366,7 @@ document.addEventListener('dblclick', (e) => {
 // ── SUPPRIMER EXO ──
 function supprimerExo(seanceIdx, exoIdx) {
   state.seances[seanceIdx].exercices.splice(exoIdx, 1);
+  saveDailySeances();
   renderSeances();
 }
 
@@ -2495,6 +2513,77 @@ function flushPendingQueue() {
       body: JSON.stringify(payload)
     }).catch(() => addToPendingQueue(payload));
   });
+}
+
+
+// ══════════════════════════════════════════════════════════
+// PERSISTANCE SÉANCES DU JOUR
+// ══════════════════════════════════════════════════════════
+
+function saveDailySeances() {
+  try {
+    const today = new Date().toDateString();
+    const toSave = {
+      date: today,
+      seances: state.seances.map(s => ({
+        patient: {
+          id: s.patient.id,
+          prenom: s.patient.prenom,
+          zone_prio: s.patient.zone_prio,
+          zone_sec: s.patient.zone_sec,
+          niveau: s.patient.niveau,
+          blocs_exclus: s.patient.blocs_exclus,
+          actif: s.patient.actif,
+          notes: s.patient.notes,
+        },
+        exercices: s.exercices.map(e => ({
+          id: e.id,
+          nom: e.nom,
+          bloc: e.bloc,
+          dosage: e.dosage,
+          materiel: e.materiel,
+          cote: e.cote,
+          notes: e.notes,
+          difficulte: e.difficulte,
+          _bloc: e._bloc || e.bloc,
+        }))
+      })),
+      selectedPatients: [...state.selectedPatients],
+    };
+    localStorage.setItem('kineapp_daily_seances', JSON.stringify(toSave));
+  } catch(e) { console.warn('Save daily seances failed:', e); }
+}
+
+function loadDailySeances() {
+  try {
+    const saved = localStorage.getItem('kineapp_daily_seances');
+    if (!saved) return false;
+    const data = JSON.parse(saved);
+    const today = new Date().toDateString();
+
+    // Si les séances ne sont pas d'aujourd'hui → on efface
+    if (data.date !== today) {
+      localStorage.removeItem('kineapp_daily_seances');
+      return false;
+    }
+
+    if (data.seances && data.seances.length > 0) {
+      state.seances = data.seances;
+      state.selectedPatients = new Set(data.selectedPatients || []);
+      state.currentSeanceIdx = 0;
+      state.dualLeft = 0;
+      state.dualRight = Math.min(1, state.seances.length - 1);
+      return true;
+    }
+    return false;
+  } catch(e) {
+    console.warn('Load daily seances failed:', e);
+    return false;
+  }
+}
+
+function clearDailySeances() {
+  localStorage.removeItem('kineapp_daily_seances');
 }
 
 // ══════════════════════════════════════════════════════════
